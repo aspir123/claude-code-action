@@ -42,22 +42,97 @@ export async function configureGitAuth(
   await $`git config user.email "${botId}+${botName}@${noreplyDomain}"`;
   console.log(`✓ Set git user as ${botName}`);
 
-  // Remove the authorization header that actions/checkout sets
-  console.log("Removing existing git authentication headers...");
-  try {
-    await $`git config --unset-all http.${GITHUB_SERVER_URL}/.extraheader`;
-    console.log("✓ Removed existing authentication headers");
-  } catch (e) {
-    console.log("No existing authentication headers to remove");
-  }
-
-  // Update the remote URL to include the token for authentication
-  console.log("Updating remote URL with authentication...");
-  const remoteUrl = `https://x-access-token:${githubToken}@${serverUrl.host}/${context.repository.owner}/${context.repository.repo}.git`;
-  await $`git remote set-url origin ${remoteUrl}`;
-  console.log("✓ Updated remote URL with authentication token");
+  await replaceCheckoutCredentials(githubToken, context);
 
   console.log("Git authentication configured successfully");
+}
+
+/**
+ * Replace the credential that actions/checkout persisted in the working tree.
+ *
+ * actions/checkout stores its token as an `http.<server>/.extraheader` entry
+ * in .git/config for the duration of the job. Claude and the tools it invokes
+ * run inside this working tree, so remove that entry and back git with the
+ * action's own token instead (a credential helper when non-write users are
+ * allowed, otherwise the origin URL). This applies to every mode, including API
+ * commit signing where no other git configuration is needed.
+ *
+ * actions/checkout < v6 stored the header directly in the repo-local config,
+ * where `git config --unset-all` removes it. Since v6.0.0 (backported to
+ * v5.0.1 and v4.3.1) the header is written to a separate file under
+ * RUNNER_TEMP that the repo config pulls in via `include.path`; `--unset-all`
+ * on the local config cannot touch an include-provided value, so the removal
+ * was a silent no-op and the checkout credential (typically the workflow
+ * GITHUB_TOKEN) stayed usable by git for the rest of the job. Clear the
+ * header from the local config AND from every included file so it can no
+ * longer authenticate while Claude runs.
+ */
+export async function replaceCheckoutCredentials(
+  githubToken: string,
+  context: GitHubContext,
+) {
+  const serverUrl = new URL(GITHUB_SERVER_URL);
+
+  // Remove the authorization header that actions/checkout sets
+  console.log("Removing existing git authentication headers...");
+  const extraheaderKey = `http.${GITHUB_SERVER_URL}/.extraheader`;
+  let removedHeader = false;
+  try {
+    await $`git config --unset-all ${extraheaderKey}`;
+    removedHeader = true;
+  } catch {
+    // No extraheader in the local config (expected on the v6+ include layout).
+  }
+  try {
+    const includePaths =
+      await $`git config --local --get-all include.path`.text();
+    for (const includePath of includePaths.split("\n")) {
+      const path = includePath.trim();
+      if (!path) continue;
+      try {
+        await $`git config --file ${path} --unset-all ${extraheaderKey}`;
+        removedHeader = true;
+      } catch {
+        // This include does not define the header; leave it untouched.
+      }
+    }
+  } catch {
+    // No include.path entries in the local config.
+  }
+  console.log(
+    removedHeader
+      ? "✓ Removed existing authentication headers"
+      : "No existing authentication headers to remove",
+  );
+
+  if (process.env.ALLOWED_NON_WRITE_USERS) {
+    // When processing content from non-write users, use a credential helper
+    // instead of embedding the token in the remote URL. The helper script reads
+    // from GH_TOKEN at auth time, so .git/config stays token-free. Written as a
+    // file to avoid shell-escaping the helper body; placed under
+    // GITHUB_ACTION_PATH so it sits alongside the action source.
+    console.log("Configuring git credential helper...");
+    process.env.GH_TOKEN = githubToken;
+    const helperPath = join(
+      process.env.GITHUB_ACTION_PATH || homedir(),
+      ".git-credential-gh-token",
+    );
+    await writeFile(
+      helperPath,
+      '#!/bin/sh\necho username=x-access-token\necho password="$GH_TOKEN"\n',
+      { mode: 0o700 },
+    );
+    const cleanUrl = `https://${serverUrl.host}/${context.repository.owner}/${context.repository.repo}.git`;
+    await $`git remote set-url origin ${cleanUrl}`;
+    await $`git config credential.helper ${helperPath}`;
+    console.log("✓ Configured credential helper");
+  } else {
+    // Update the remote URL to include the token for authentication
+    console.log("Updating remote URL with authentication...");
+    const remoteUrl = `https://x-access-token:${githubToken}@${serverUrl.host}/${context.repository.owner}/${context.repository.repo}.git`;
+    await $`git remote set-url origin ${remoteUrl}`;
+    console.log("✓ Updated remote URL with authentication token");
+  }
 }
 
 /**
