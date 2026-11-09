@@ -21,6 +21,7 @@ import {
   isPullRequestEvent,
   isPullRequestReviewEvent,
   isPullRequestReviewCommentEvent,
+  isWorkflowRunEvent,
 } from "../github/context";
 import type { GitHubContext } from "../github/context";
 import { detectMode } from "../modes/detector";
@@ -33,20 +34,37 @@ import { collectActionInputsPresence } from "./collect-inputs";
 import { updateCommentLink } from "./update-comment-link";
 import { formatTurnsFromData } from "./format-turns";
 import type { Turn } from "./format-turns";
+import { redactSecrets } from "../github/utils/sanitizer";
 // Base-action imports (used directly instead of subprocess)
+import { setupWorkloadIdentity } from "../../base-action/src/workload-identity";
+import type { WorkloadIdentityHandle } from "../../base-action/src/workload-identity";
 import { validateEnvironmentVariables } from "../../base-action/src/validate-env";
 import { setupClaudeCodeSettings } from "../../base-action/src/setup-claude-code-settings";
 import { installPlugins } from "../../base-action/src/install-plugins";
 import { preparePrompt } from "../../base-action/src/prepare-prompt";
 import { runClaude } from "../../base-action/src/run-claude";
 import type { ClaudeRunResult } from "../../base-action/src/run-claude-sdk";
+import { setExecutionFileOutputIfPresent } from "../../base-action/src/execution-file";
+
+// Exported for unit testing. `set -o pipefail` makes curl's non-zero exit
+// propagate through the pipe so the install retry logic actually triggers
+// on 429/403 instead of silently succeeding (see #1136).
+export function buildInstallCommand(version: string): string {
+  return `set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash -s -- ${version}`;
+}
 
 /**
  * Install Claude Code CLI, handling retry logic and custom executable paths.
+ * Returns the absolute path to the claude executable.
  */
-async function installClaudeCode(): Promise<void> {
+async function installClaudeCode(): Promise<string> {
   const customExecutable = process.env.PATH_TO_CLAUDE_CODE_EXECUTABLE;
   if (customExecutable) {
+    if (/[\x00-\x1f\x7f]/.test(customExecutable)) {
+      throw new Error(
+        "PATH_TO_CLAUDE_CODE_EXECUTABLE contains control characters (e.g. newlines), which is not allowed",
+      );
+    }
     console.log(`Using custom Claude Code executable: ${customExecutable}`);
     const claudeDir = dirname(customExecutable);
     // Add to PATH by appending to GITHUB_PATH
@@ -56,10 +74,10 @@ async function installClaudeCode(): Promise<void> {
     }
     // Also add to current process PATH
     process.env.PATH = `${claudeDir}:${process.env.PATH}`;
-    return;
+    return customExecutable;
   }
 
-  const claudeCodeVersion = "2.1.88";
+  const claudeCodeVersion = "2.1.319";
   console.log(`Installing Claude Code v${claudeCodeVersion}...`);
 
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -68,10 +86,7 @@ async function installClaudeCode(): Promise<void> {
       await new Promise<void>((resolve, reject) => {
         const child = spawn(
           "bash",
-          [
-            "-c",
-            `curl -fsSL https://claude.ai/install.sh | bash -s -- ${claudeCodeVersion}`,
-          ],
+          ["-c", buildInstallCommand(claudeCodeVersion)],
           { stdio: "inherit" },
         );
         child.on("close", (code) => {
@@ -88,7 +103,7 @@ async function installClaudeCode(): Promise<void> {
         await appendFile(githubPath, `${homeBin}\n`);
       }
       process.env.PATH = `${homeBin}:${process.env.PATH}`;
-      return;
+      return `${homeBin}/claude`;
     } catch (error) {
       if (attempt === 3) {
         throw new Error(
@@ -99,6 +114,7 @@ async function installClaudeCode(): Promise<void> {
       await new Promise((resolve) => setTimeout(resolve, 5000));
     }
   }
+  throw new Error("unreachable");
 }
 
 /**
@@ -122,7 +138,7 @@ async function writeStepSummary(executionFile: string): Promise<void> {
       fallback +=
         "Failed to format output (please report). Here's the raw JSON:\n\n";
       fallback += "```json\n";
-      fallback += readFileSync(executionFile, "utf-8");
+      fallback += redactSecrets(readFileSync(executionFile, "utf-8"));
       fallback += "\n```\n";
       await appendFile(summaryFile, fallback);
     } catch {
@@ -142,6 +158,10 @@ async function run() {
   let prepareError: string | undefined;
   let context: GitHubContext | undefined;
   let octokit: Octokits | undefined;
+  let workloadIdentity: WorkloadIdentityHandle | undefined;
+  // Paths reverted to the PR base branch, which cleanup must not commit back
+  // onto the PR author's branch. Empty unless restoreConfigFromBase ran.
+  let restoredConfigPaths: string[] = [];
   // Track whether we've completed prepare phase, so we can attribute errors correctly
   let prepareCompleted = false;
   try {
@@ -170,8 +190,10 @@ async function run() {
     process.env.GITHUB_TOKEN = githubToken;
     process.env.GH_TOKEN = githubToken;
 
-    // Check write permissions (only for entity contexts)
-    if (isEntityContext(context)) {
+    // Check write permissions for entity contexts, and for workflow_run
+    // events, whose upstream run may have been started by an actor without
+    // write access (e.g. the author of a fork pull request)
+    if (isEntityContext(context) || isWorkflowRunEvent(context)) {
       const hasWritePermissions = await checkWritePermissions(
         octokit.rest,
         context,
@@ -215,7 +237,7 @@ async function run() {
     prepareCompleted = true;
 
     // Phase 2: Install Claude Code CLI
-    await installClaudeCode();
+    const claudeExecutable = await installClaudeCode();
 
     // Phase 3: Run Claude (import base-action directly)
     // Set env vars needed by the base-action code
@@ -223,14 +245,18 @@ async function run() {
     process.env.CLAUDE_CODE_ACTION = "1";
     process.env.DETAILED_PERMISSION_MESSAGES = "1";
 
+    // When workload identity federation is configured, fetch the GitHub OIDC
+    // identity token and expose it to the CLI before validating auth env vars.
+    workloadIdentity = await setupWorkloadIdentity();
+
     validateEnvironmentVariables();
 
     // On PRs, .claude/ and .mcp.json in the checkout are attacker-controlled.
     // Restore them from the base branch before the CLI reads them.
     //
     // We read pull_request.base.ref from the payload directly because agent
-    // mode's branchInfo.baseBranch defaults to "main" rather than the PR's
-    // actual target (agent/index.ts). For issue_comment on a PR the payload
+    // mode's branchInfo.baseBranch defaults to the repo's default branch rather
+    // than the PR's actual target (agent/index.ts). For issue_comment on a PR the payload
     // lacks base.ref, so we fall back to the mode-provided value — tag mode
     // fetches it from GraphQL; agent mode on issue_comment is an edge case
     // that at worst restores from the wrong trusted branch (still secure).
@@ -245,7 +271,7 @@ async function run() {
         validateBranchName(restoreBase);
       }
       if (restoreBase) {
-        restoreConfigFromBase(restoreBase);
+        restoredConfigPaths = restoreConfigFromBase(restoreBase);
       }
     }
 
@@ -254,7 +280,7 @@ async function run() {
     await installPlugins(
       process.env.INPUT_PLUGIN_MARKETPLACES,
       process.env.INPUT_PLUGINS,
-      process.env.INPUT_PATH_TO_CLAUDE_CODE_EXECUTABLE,
+      claudeExecutable,
     );
 
     const promptFile =
@@ -269,8 +295,7 @@ async function run() {
       claudeArgs: prepareResult.claudeArgs,
       appendSystemPrompt: process.env.APPEND_SYSTEM_PROMPT,
       model: process.env.ANTHROPIC_MODEL,
-      pathToClaudeCodeExecutable:
-        process.env.INPUT_PATH_TO_CLAUDE_CODE_EXECUTABLE,
+      pathToClaudeCodeExecutable: claudeExecutable,
       showFullOutput: process.env.INPUT_SHOW_FULL_OUTPUT,
     });
 
@@ -290,14 +315,19 @@ async function run() {
     core.setOutput("conclusion", claudeResult.conclusion);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
+    executionFile ??= setExecutionFileOutputIfPresent();
     // Only mark as prepare failure if we haven't completed the prepare phase
     if (!prepareCompleted) {
       prepareSuccess = false;
       prepareError = errorMessage;
     }
-    core.setFailed(`Action failed with error: ${errorMessage}`);
+    core.setFailed(`Action failed with error: ${redactSecrets(errorMessage)}`);
   } finally {
     // Phase 4: Cleanup (always runs)
+
+    // Stop refreshing the workload identity token file and delete the token
+    // material so it doesn't outlive this step
+    workloadIdentity?.stop();
 
     // Update tracking comment
     if (
@@ -312,7 +342,7 @@ async function run() {
           commentId,
           githubToken,
           claudeBranch,
-          baseBranch: baseBranch || "main",
+          baseBranch: baseBranch || context.repository.default_branch || "main",
           triggerUsername: context.actor,
           context,
           octokit,
@@ -321,6 +351,7 @@ async function run() {
           prepareSuccess,
           prepareError,
           useCommitSigning: context.inputs.useCommitSigning,
+          restoredConfigPaths,
         });
       } catch (error) {
         console.error("Error updating comment with job link:", error);

@@ -3,17 +3,23 @@ import { createInitialComment } from "../../github/operations/comments/create-in
 import { setupBranch } from "../../github/operations/branch";
 import {
   configureGitAuth,
+  replaceCheckoutCredentials,
   setupSshSigning,
 } from "../../github/operations/git-config";
 import { prepareMcpConfig } from "../../mcp/install-mcp-server";
 import {
   fetchGitHubData,
-  extractTriggerTimestamp,
+  resolveTriggerTimestamp,
   extractOriginalTitle,
   extractOriginalBody,
 } from "../../github/data/fetcher";
 import { createPrompt } from "../../create-prompt";
-import { isEntityContext } from "../../github/context";
+import {
+  isEntityContext,
+  isIssueCommentEvent,
+  isPullRequestReviewCommentEvent,
+} from "../../github/context";
+import { updateClaudeComment } from "../../github/operations/comments/update-claude-comment";
 import type { GitHubContext } from "../../github/context";
 import type { Octokits } from "../../github/api/client";
 import { parseAllowedTools } from "../agent/parse-tools";
@@ -45,7 +51,7 @@ export async function prepareTagMode({
   const commentData = await createInitialComment(octokit.rest, context);
   const commentId = commentData.id;
 
-  const triggerTime = extractTriggerTimestamp(context);
+  const triggerTime = await resolveTriggerTimestamp(context, octokit);
   const originalTitle = extractOriginalTitle(context);
   const originalBody = extractOriginalBody(context);
 
@@ -63,7 +69,30 @@ export async function prepareTagMode({
   });
 
   // Setup branch
-  const branchInfo = await setupBranch(octokit, githubData, context);
+  const editedAt =
+    context.eventAction === "edited" &&
+    (isIssueCommentEvent(context) || isPullRequestReviewCommentEvent(context))
+      ? context.payload.comment.updated_at
+      : undefined;
+  let branchInfo;
+  try {
+    branchInfo = await setupBranch(
+      octokit,
+      githubData,
+      context,
+      editedAt || triggerTime,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await updateClaudeComment(octokit.rest, {
+      owner: context.repository.owner,
+      repo: context.repository.repo,
+      commentId,
+      body: message,
+      isPullRequestReviewComment: isPullRequestReviewCommentEvent(context),
+    }).catch((e) => console.error(`Failed to update tracking comment: ${e}`));
+    throw error;
+  }
 
   // Configure git authentication
   // SSH signing takes precedence if provided
@@ -96,6 +125,16 @@ export async function prepareTagMode({
       await configureGitAuth(githubToken, context, user);
     } catch (error) {
       console.error("Failed to configure git authentication:", error);
+      throw error;
+    }
+  } else {
+    // Commits go through the GitHub API, so no git user setup is needed, but
+    // the credential actions/checkout left in git config should still be
+    // replaced with the action's own.
+    try {
+      await replaceCheckoutCredentials(githubToken, context);
+    } catch (error) {
+      console.error("Failed to configure git credentials:", error);
       throw error;
     }
   }

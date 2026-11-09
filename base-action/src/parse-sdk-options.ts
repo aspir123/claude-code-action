@@ -19,10 +19,40 @@ const ACCUMULATING_FLAGS = new Set([
   "disallowedTools",
   "disallowed-tools",
   "mcp-config",
+  "add-dir",
 ]);
 
 // Delimiter used to join accumulated flag values
 const ACCUMULATE_DELIMITER = "\x00";
+
+// shell-quote treats ()|&;<> as control operators and splits adjacent text
+// around them into separate tokens (returned as `{op}` objects, which we then
+// dropped). For CLI args these must be literal characters — e.g. unquoted
+// `--allowedTools Bash(gh:*)` was being mangled into bare `Bash`, silently
+// widening a scoped permission rule to Bash(*). We escape each metachar to a
+// Unicode private-use codepoint before parsing and restore it afterward,
+// keeping shell-quote's quote/whitespace handling intact.
+const SHELL_META_PAIRS: [string, string][] = [
+  ["(", ""],
+  [")", ""],
+  ["|", ""],
+  ["&", ""],
+  [";", ""],
+  ["<", ""],
+  [">", ""],
+];
+const SHELL_META_ESCAPE = new Map(SHELL_META_PAIRS);
+const SHELL_META_UNESCAPE = new Map(SHELL_META_PAIRS.map(([k, v]) => [v, k]));
+const SHELL_META_ESCAPE_RE = /[()|&;<>]/g;
+const SHELL_META_UNESCAPE_RE = /[-]/g;
+
+function escapeShellMeta(s: string): string {
+  return s.replace(SHELL_META_ESCAPE_RE, (c) => SHELL_META_ESCAPE.get(c)!);
+}
+
+function unescapeShellMeta(s: string): string {
+  return s.replace(SHELL_META_UNESCAPE_RE, (c) => SHELL_META_UNESCAPE.get(c)!);
+}
 
 type McpConfig = {
   mcpServers?: Record<string, unknown>;
@@ -80,6 +110,20 @@ function mergeMcpConfigs(configValues: string[]): string {
 }
 
 /**
+ * Strip comment lines from a shell argument string.
+ * Lines whose first non-whitespace character is `#` are removed entirely.
+ * Inline `#` within a line (e.g. inside a quoted value) is left untouched
+ * because shell-quote handles quoting — we only need to remove full comment lines
+ * before shell-quote sees them.
+ */
+function stripShellComments(input: string): string {
+  return input
+    .split("\n")
+    .filter((line) => !line.trim().startsWith("#"))
+    .join("\n");
+}
+
+/**
  * Parse claudeArgs string into extraArgs record for SDK pass-through
  * The SDK/CLI will handle --mcp-config, --json-schema, etc.
  * For allowedTools and disallowedTools, multiple occurrences are accumulated (null-char joined).
@@ -92,9 +136,19 @@ function parseClaudeArgsToExtraArgs(
   if (!claudeArgs?.trim()) return {};
 
   const result: Record<string, string | null> = {};
-  const args = parseShellArgs(claudeArgs).filter(
-    (arg): arg is string => typeof arg === "string",
-  );
+  const args = parseShellArgs(escapeShellMeta(stripShellComments(claudeArgs)))
+    .map((arg) => {
+      if (typeof arg === "string") return unescapeShellMeta(arg);
+      // With control metachars escaped above, the only non-string shell-quote
+      // can still emit is a glob op (bareword containing *, ?, or [). Its
+      // `pattern` field is the verbatim token text — use it as-is so values
+      // like `Bash(cmd:*)` and `Read(path/**)` round-trip intact.
+      if (typeof arg === "object" && arg !== null && "pattern" in arg) {
+        return unescapeShellMeta((arg as { pattern: string }).pattern);
+      }
+      return undefined;
+    })
+    .filter((arg): arg is string => typeof arg === "string");
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -146,6 +200,20 @@ export function parseSdkOptions(options: ClaudeOptions): ParsedSdkOptions {
 
   // Detect if --json-schema is present (for hasJsonSchema flag)
   const hasJsonSchema = "json-schema" in extraArgs;
+
+  const modelFromClaudeArgs = extraArgs["model"] || undefined;
+  delete extraArgs["model"];
+
+  const maxTurnsFromClaudeArgs = extraArgs["max-turns"] || undefined;
+  delete extraArgs["max-turns"];
+
+  const additionalDirectories = extraArgs["add-dir"]
+    ? extraArgs["add-dir"]
+        .split(ACCUMULATE_DELIMITER)
+        .map((dir) => dir.trim())
+        .filter(Boolean)
+    : [];
+  delete extraArgs["add-dir"];
 
   // Extract and merge allowedTools from all sources:
   // 1. From extraArgs (parsed from claudeArgs - contains tag mode's tools)
@@ -215,6 +283,16 @@ export function parseSdkOptions(options: ClaudeOptions): ParsedSdkOptions {
   // Set the entrypoint for Claude Code to identify this as the GitHub Action
   env.CLAUDE_CODE_ENTRYPOINT = "claude-code-github-action";
 
+  // Remove OIDC token request variables so Claude cannot mint new tokens.
+  // These are only needed by the action itself (via @actions/core.getIDToken()),
+  // not by the Claude session.
+  delete env.ACTIONS_ID_TOKEN_REQUEST_URL;
+  delete env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+
+  // Remove ALL_INPUTS as it is only needed during initial setup to determine
+  // input presence (collectActionInputsPresence) and contains serialized workflow inputs.
+  delete env.ALL_INPUTS;
+
   // Build system prompt option - default to claude_code preset
   let systemPrompt: SdkOptions["systemPrompt"];
   if (options.systemPrompt) {
@@ -236,8 +314,12 @@ export function parseSdkOptions(options: ClaudeOptions): ParsedSdkOptions {
   // Build SDK options - use merged tools from both direct options and claudeArgs
   const sdkOptions: SdkOptions = {
     // Direct options from ClaudeOptions inputs
-    model: options.model,
-    maxTurns: options.maxTurns ? parseInt(options.maxTurns, 10) : undefined,
+    model: options.model || modelFromClaudeArgs,
+    maxTurns: options.maxTurns
+      ? parseInt(options.maxTurns, 10)
+      : maxTurnsFromClaudeArgs
+        ? parseInt(maxTurnsFromClaudeArgs, 10)
+        : undefined,
     allowedTools:
       mergedAllowedTools.length > 0 ? mergedAllowedTools : undefined,
     disallowedTools:
@@ -245,6 +327,8 @@ export function parseSdkOptions(options: ClaudeOptions): ParsedSdkOptions {
     systemPrompt,
     fallbackModel: options.fallbackModel,
     pathToClaudeCodeExecutable: options.pathToClaudeCodeExecutable,
+    additionalDirectories:
+      additionalDirectories.length > 0 ? additionalDirectories : undefined,
 
     // Pass through claudeArgs as extraArgs - CLI handles --mcp-config, --json-schema, etc.
     // Note: allowedTools and disallowedTools have been removed from extraArgs to prevent duplicates
